@@ -83,6 +83,7 @@ int main() {
                 }
             }
         }
+        free(events->events);
         free(events);
     }
 

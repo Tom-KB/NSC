@@ -116,6 +116,7 @@ void* listenerThread(void* arg)
                 drawChat();
             }
         }
+        free(events->events);
         free(events);
     }
 

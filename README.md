@@ -12,7 +12,7 @@
 
 ## History
 This is the second version of the library, it was created in **July 2024**.  
-It’s not thoroughly documented, as I mainly built it as a support tool for my other project, [NSCpp](#ADDLINK).  
+It’s not thoroughly documented, as I mainly built it as a support tool for my other project, [NSCpp](https://github.com/Tom-KB/NSCpp).  
 Feel free to use it if you find it useful. It may receive occasional updates, but mainly for **bug fixes**—no new features are planned.
 
 ## Features
