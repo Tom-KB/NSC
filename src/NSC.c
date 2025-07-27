@@ -234,61 +234,58 @@ ServerEventsList* serverListen(Server* server) {
     // Check all connected clients for data (TCP)
     for (int i = 0; i < server->numClients; i++) {
         if (FD_ISSET(server->clients[i].socket, &copySet)) {
-            char* buffer = NULL;
-            int bytesReceived = readMessage(&server->clients[i], &buffer);
+            while (1) {
+                char* buffer = NULL;
+                int bytesReceived = readMessage(&server->clients[i], &buffer);
 
-            if (bytesReceived == READMSG_CONN_CLOSED) {
-                eventsList->events = eventReallocServer(eventsList->events, eventsList->numEvents, &eventMemory);
-                
-                // Disconnection event
-                eventsList->events[eventsList->numEvents].type = Disconnection;
-                eventsList->events[eventsList->numEvents].socket = server->clients[i].socket;
-                eventsList->events[eventsList->numEvents].sin = server->clients[i].sin;
-                eventsList->events[eventsList->numEvents].ipType = server->ipType;
-                eventsList->events[eventsList->numEvents].data = NULL;
-                eventsList->numEvents++;
+                if (bytesReceived == READMSG_NO_DATA) {
+                    if (buffer != NULL) free(buffer);
+                    break; // No more data available
+                }
+                else if (bytesReceived == READMSG_CONN_CLOSED || 
+                        bytesReceived == READMSG_ALLOC_FAILED || 
+                        bytesReceived == READMSG_SOCKET_ERROR) {
+                    eventsList->events = eventReallocServer(eventsList->events, eventsList->numEvents, &eventMemory);
+                    
+                    // Disconnection event
+                    eventsList->events[eventsList->numEvents].type = Disconnection;
+                    eventsList->events[eventsList->numEvents].socket = server->clients[i].socket;
+                    eventsList->events[eventsList->numEvents].sin = server->clients[i].sin;
+                    eventsList->events[eventsList->numEvents].ipType = server->ipType;
+                    eventsList->events[eventsList->numEvents].data = NULL;
+                    eventsList->numEvents++;
 
-                if (buffer != NULL) free(buffer);
-                clientDisconnect(server, i);
-                i--; // replaced the current i-th client by the last one, so we go back to check it
-            }
-            else if (bytesReceived == READMSG_MSG_TOO_LARGE) {
-                if (buffer != NULL) free(buffer);
-            }
-            else if (bytesReceived == READMSG_ALLOC_FAILED || bytesReceived == READMSG_SOCKET_ERROR) {
-                eventsList->events = eventReallocServer(eventsList->events, eventsList->numEvents, &eventMemory);
+                    if (buffer != NULL) free(buffer);
+                    clientDisconnect(server, i);
+                    i--; // replaced the current i-th client by the last one, so we go back to check it
+                    break;
+                }
+                else if (bytesReceived == READMSG_MSG_TOO_LARGE) {
+                    if (buffer != NULL) free(buffer);
+                    continue; // tenter de lire un autre message
+                }
+                else if (bytesReceived > 0) {
+                    bytesReceived = (bytesReceived < BufferSize) ? bytesReceived : BufferSize - 1;
 
-                // Disconnection event
-                eventsList->events[eventsList->numEvents].type = Disconnection;
-                eventsList->events[eventsList->numEvents].socket = server->clients[i].socket;
-                eventsList->events[eventsList->numEvents].sin = server->clients[i].sin;
-                eventsList->events[eventsList->numEvents].ipType = server->ipType;
-                eventsList->events[eventsList->numEvents].data = NULL;
-                eventsList->numEvents++;
+                    eventsList->events = eventReallocServer(eventsList->events, eventsList->numEvents, &eventMemory);
 
-                if (buffer != NULL) free(buffer);
-                clientDisconnect(server, i);
-                i--;
-            }
-            else if (bytesReceived > 0) {
-                bytesReceived = (bytesReceived < BufferSize) ? bytesReceived : BufferSize - 1;
+                    // DataReceived event
+                    eventsList->events[eventsList->numEvents].type = DataReceived;
+                    eventsList->events[eventsList->numEvents].socket = server->clients[i].socket;
+                    eventsList->events[eventsList->numEvents].sin = server->clients[i].sin;
+                    eventsList->events[eventsList->numEvents].ipType = server->ipType;
+                    eventsList->events[eventsList->numEvents].dataSize = bytesReceived;
+                    eventsList->events[eventsList->numEvents].data = (char*)malloc(bytesReceived);
+                    memcpy(eventsList->events[eventsList->numEvents].data, buffer, bytesReceived);
+                    eventsList->numEvents++;
 
-                eventsList->events = eventReallocServer(eventsList->events, eventsList->numEvents, &eventMemory);
-
-                // DataReceived event
-                eventsList->events[eventsList->numEvents].type = DataReceived;
-                eventsList->events[eventsList->numEvents].socket = server->clients[i].socket;
-                eventsList->events[eventsList->numEvents].sin = server->clients[i].sin;
-                eventsList->events[eventsList->numEvents].ipType = server->ipType;
-                eventsList->events[eventsList->numEvents].dataSize = bytesReceived;
-                eventsList->events[eventsList->numEvents].data = (char*)malloc(bytesReceived);
-                memcpy(eventsList->events[eventsList->numEvents].data, buffer, bytesReceived);
-                eventsList->numEvents++;
-
-                if (buffer != NULL) free(buffer);
-            }
-            else {
-                if (buffer != NULL) free(buffer);
+                    if (buffer != NULL) free(buffer);
+                    continue; // Try to continue the reading of other messages
+                }
+                else {
+                    if (buffer != NULL) free(buffer);
+                    break;
+                }
             }
         }
     }
