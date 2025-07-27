@@ -85,6 +85,7 @@ void drawChat() {
         else printf("\n\n");
     }
     printf("Enter a message : %s", inputBuffer);
+    fflush(stdout);
 }
 
 // Function in which every client's events will be processed
@@ -116,7 +117,6 @@ void* listenerThread(void* arg)
                 drawChat();
             }
         }
-        free(events->events);
         free(events);
     }
 
@@ -126,10 +126,7 @@ void* listenerThread(void* arg)
 int main() {
     #if defined(_WIN32)
         startup();
-    #else
-        enableImmediateInput();
     #endif
-
     // Client's Configuration (must match the Server)
     int usedConnType = TCP;
     int usedIpType = IPv4;
@@ -146,6 +143,11 @@ int main() {
     // You have to enter you desired name (max MAX_NAME_SIZE chars)
     fgets(name, MAX_NAME_SIZE, stdin);
     name[strlen(name)-1] = '\0'; // Remove the '\n'
+
+    // Linux non-canonical mode
+    #ifndef _WIN32
+        enableImmediateInput();
+    #endif
 
     // Lancement du thread d'écoute
     #if defined(_WIN32)

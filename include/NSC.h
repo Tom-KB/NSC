@@ -101,6 +101,12 @@ extern "C" {
     #define BufferSize 8192 // Maximum size of the buffer (default : 8192)
     #define QueueLength 65535 // Maximum length of the queue of pending connections
     #define EventBlock 8 // Block of events to allocate
+    
+    #define READMSG_NO_DATA          0   // Not enough data yet for a full message
+    #define READMSG_CONN_CLOSED     -1   // Connection closed by peer (recv() == 0)
+    #define READMSG_ALLOC_FAILED    -2   // Memory allocation failure
+    #define READMSG_MSG_TOO_LARGE   -3   // Message length invalid / too large
+    #define READMSG_SOCKET_ERROR    -4   // Socket error other than non-blocking wait
 
     // Union for the address
     typedef union {
