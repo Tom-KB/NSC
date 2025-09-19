@@ -90,11 +90,11 @@ typedef struct sockaddr SOCKADDR;
 extern "C" {
 #endif
     // Definition for the connection's type
-    enum ConnType { TCP, UDP };
-    enum IP_Type { IPv4, IPv6 };
+    enum NSC_ConnType { TCP, UDP };
+    enum NSC_IP_Type { IPv4, IPv6 };
 
     // Event definition
-    enum EventType { Connection, DataReceived, Disconnection };
+    enum NSC_EventType { Connection, DataReceived, Disconnection };
 
     // Constants
     #define MaxClients 100 // Maximum number of clients on the server
