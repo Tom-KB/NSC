@@ -1,6 +1,6 @@
 /*
 Network System for C (NSC)
-Version 2.0
+Version 3.0
 Starring : Thomas K/BIDI
 
 Description:
@@ -18,6 +18,7 @@ You can also do domain name resolution.
 #include <math.h>
 #include <assert.h>
 #include <stdint.h>
+#include <string.h>
 
 // Definition according to the OS used - to make the library cross-platform
 #if defined (_WIN32)
@@ -98,15 +99,25 @@ extern "C" {
 
     // Constants
     #define MaxClients 100 // Maximum number of clients on the server
-    #define BufferSize 8192 // Maximum size of the buffer (default : 8192)
+    #define ReadChunk 8192 // How many bytes we take from the socket at once (performance detail)
+    #define BufferSize ReadChunk // Kept for source compatibility, and used for UDP datagrams
+    #define MaxMessageSize (16 * 1024 * 1024) // Largest announced length we accept to allocate (anti-abuse policy)
+    #define SendTimeoutMs 5000 // How long sendMessage waits for a saturated send buffer to drain
     #define QueueLength 65535 // Maximum length of the queue of pending connections
     #define EventBlock 8 // Block of events to allocate
-    
+
     #define READMSG_NO_DATA          0   // Not enough data yet for a full message
     #define READMSG_CONN_CLOSED     -1   // Connection closed by peer (recv() == 0)
     #define READMSG_ALLOC_FAILED    -2   // Memory allocation failure
-    #define READMSG_MSG_TOO_LARGE   -3   // Message length invalid / too large
+    #define READMSG_MSG_TOO_LARGE   -3   // Announced length above MaxMessageSize
     #define READMSG_SOCKET_ERROR    -4   // Socket error other than non-blocking wait
+    #define READMSG_BAD_FRAME       -6   // Announced length is invalid : the stream is desynchronised
+
+    #define SENDMSG_OK               0   // The whole message reached the send buffer
+    #define SENDMSG_INVALID_ARG     -1   // NULL socket/address, or a length of 0
+    #define SENDMSG_MSG_TOO_LARGE   -3   // Length above MaxMessageSize
+    #define SENDMSG_SOCKET_ERROR    -4   // Socket error while sending
+    #define SENDMSG_TIMEOUT         -5   // Send buffer stayed full for SendTimeoutMs
 
     // Union for the address
     typedef union {
@@ -145,8 +156,9 @@ extern "C" {
     // Client's buffer informations
     typedef struct {
         char* buffer;
-        int len;
-        int pos;
+        int cap; // Allocated size of the buffer : grows on demand up to 4 + MaxMessageSize
+        int len; // Number of valid bytes held in the buffer
+        int pos; // Reading position inside those valid bytes
     } ClientBuffer;
 
     // Client's structure
@@ -257,12 +269,19 @@ extern "C" {
 
     /*
     Parameters:
-        - SOCKET socket : The socket to send the data to
-        - const char** msg : The buffer to which the data will be assigned
+        - Client* client : The client whose socket and accumulation buffer are read
+        - char** out_msg : The buffer to which the data will be assigned (caller must free it)
+    Output:
+        - int : The length of the message on success, or one of the READMSG_* codes
     Description:
         For a TCP connexion, read the message of the following format ->
         [length : 4 bytes][message]
         and give the **msg the address of the message's buffer.
+        The call never blocks : when only a part of a message has arrived it
+        returns READMSG_NO_DATA and keeps the fragment in the client's buffer,
+        which grows on demand up to MaxMessageSize.
+        READMSG_MSG_TOO_LARGE and READMSG_BAD_FRAME mean the stream cannot be
+        parsed any more : the caller has to drop the connection.
     */
     int readMessage(Client* client, char **out_msg);
 
@@ -273,13 +292,19 @@ extern "C" {
         - uint32_t len : The length of the data
         - int connType : The type of connection on which you want to send the data
         - SOCKADDR_IN* sin : The address to send the data to
+    Output:
+        - int : SENDMSG_OK on success, or one of the other SENDMSG_* codes
     Description:
         This function sends the data to the given socket according to the type
-        of connection you want. 
+        of connection you want.
         In the case of UDP the length of the message
         is not send.
+        Over TCP the whole message is sent : the sockets are non-blocking, so a
+        saturated send buffer is waited on rather than treated as an error.
+        Truncating here would leave the length header on the wire without its
+        payload and desynchronise the peer for good.
     */
-    void sendMessage(SOCKET* socket, const char *msg, uint32_t len, int connType, int ipType, SIN* sin);
+    int sendMessage(SOCKET* socket, const char *msg, uint32_t len, int connType, int ipType, SIN* sin);
 
     /*
     Parameters:
