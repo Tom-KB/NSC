@@ -1,7 +1,11 @@
 #include "NSC.h"
 
 Server* createServer(const char* address, int port, int connType, int ipType) {
-    Server* server = (Server*)malloc(sizeof(Server)); // Create the server's structure
+    Server* server = (Server*)calloc(1, sizeof(Server)); // Create the server's structure
+    if (!server) {
+        fprintf(stderr, "Error allocating the server\n");
+        return NULL;
+    }
 
     // Create the server's socket
     int type = (connType == TCP) ? SOCK_STREAM : SOCK_DGRAM; // Support for TCP and UDP
@@ -61,7 +65,13 @@ Server* createServer(const char* address, int port, int connType, int ipType) {
     server->maxSocket = server->socket;
 
     // Create the array of clients
-    server->clients = (Client*)malloc(sizeof(Client) * MaxClients);
+    server->clients = (Client*)calloc(MaxClients, sizeof(Client));
+    if (!server->clients) {
+        fprintf(stderr, "Error allocating the clients array\n");
+        closesocket(server->socket);
+        free(server);
+        return NULL;
+    }
     server->numClients = 0;
 
     // Bind the server's socket
@@ -90,14 +100,28 @@ Server* createServer(const char* address, int port, int connType, int ipType) {
 }
 
 void closeServer(Server* server) {
+    if (!server) return;
+
     closesocket(server->socket);
+
+    // Release the buffer of every client still connected
+    for (int i = 0; i < server->numClients; i++) {
+        closesocket(server->clients[i].socket);
+        free(server->clients[i].bufferData.buffer);
+    }
+
     free(server->clients);
     free(server);
 }
 
 Client* acceptClient(Server* server) {
     Client client; // Create the client's structure
-    
+
+    // The clients array holds MaxClients entries : accepting past that would write out of bounds
+    if (server->numClients >= MaxClients) {
+        return NULL;
+    }
+
     // Accept the connection to the server's socket
     if (server->ipType == IPv4) {
     client.recSize = sizeof(client.sin.in);
@@ -114,9 +138,15 @@ Client* acceptClient(Server* server) {
     // Set the client's connection type and IP type
     client.connType = server->connType;
     client.ipType = server->ipType;
-    
+
     // Init the client's buffer
-    client.bufferData.buffer = malloc(BufferSize);
+    client.bufferData.buffer = malloc(ReadChunk);
+    if (!client.bufferData.buffer) {
+        fprintf(stderr, "Buffer malloc() failed\n");
+        closesocket(client.socket);
+        return NULL;
+    }
+    client.bufferData.cap = ReadChunk;
     client.bufferData.len = 0;
     client.bufferData.pos = 0;
 
@@ -164,7 +194,9 @@ ServerEventsList* serverListen(Server* server) {
 
     for (int i = 0; i < server->numClients; i++) {
         FD_SET(server->clients[i].socket, &server->socketSet);
-        server->maxSocket = server->clients[i].socket;
+        if (server->clients[i].socket > server->maxSocket) {
+            server->maxSocket = server->clients[i].socket; // select() needs the highest one, not the last one
+        }
     }
 
     // Define the timeout for the select function
@@ -242,11 +274,14 @@ ServerEventsList* serverListen(Server* server) {
                     if (buffer != NULL) free(buffer);
                     break; // No more data available
                 }
-                else if (bytesReceived == READMSG_CONN_CLOSED || 
-                        bytesReceived == READMSG_ALLOC_FAILED || 
-                        bytesReceived == READMSG_SOCKET_ERROR) {
+                else if (bytesReceived == READMSG_CONN_CLOSED ||
+                        bytesReceived == READMSG_ALLOC_FAILED ||
+                        bytesReceived == READMSG_SOCKET_ERROR ||
+                        bytesReceived == READMSG_MSG_TOO_LARGE ||
+                        bytesReceived == READMSG_BAD_FRAME) {
+                    // On the last two the framing is lost : reading further would only return the same error
                     eventsList->events = eventReallocServer(eventsList->events, eventsList->numEvents, &eventMemory);
-                    
+
                     // Disconnection event
                     eventsList->events[eventsList->numEvents].type = Disconnection;
                     eventsList->events[eventsList->numEvents].socket = server->clients[i].socket;
@@ -260,13 +295,7 @@ ServerEventsList* serverListen(Server* server) {
                     i--; // replaced the current i-th client by the last one, so we go back to check it
                     break;
                 }
-                else if (bytesReceived == READMSG_MSG_TOO_LARGE) {
-                    if (buffer != NULL) free(buffer);
-                    continue; // tenter de lire un autre message
-                }
                 else if (bytesReceived > 0) {
-                    bytesReceived = (bytesReceived < BufferSize) ? bytesReceived : BufferSize - 1;
-
                     eventsList->events = eventReallocServer(eventsList->events, eventsList->numEvents, &eventMemory);
 
                     // DataReceived event
@@ -297,6 +326,13 @@ void clientDisconnect(Server* server, int index) {
     FD_CLR(server->clients[index].socket, &server->socketSet); // Remove the client's socket from the server's socket set
     closesocket(server->clients[index].socket); // Close the client's socket
 
+    // Release the accumulation buffer, otherwise every disconnection leaks it
+    free(server->clients[index].bufferData.buffer);
+    server->clients[index].bufferData.buffer = NULL;
+    server->clients[index].bufferData.cap = 0;
+    server->clients[index].bufferData.len = 0;
+    server->clients[index].bufferData.pos = 0;
+
     // replace the disconnected client with the last client in the list
     server->clients[index] = server->clients[server->numClients - 1];
 
@@ -324,14 +360,15 @@ Client* createClient(const char* address, int port, int connType, int ipType) {
     client->ipType = ipType;
 
     // Init the client's buffer
-    client->bufferData.buffer = malloc(BufferSize);
-    memset(client->bufferData.buffer, 0, BufferSize);
+    client->bufferData.buffer = malloc(ReadChunk);
     if (!client->bufferData.buffer) {
         closesocket(client->socket);
         free(client);
         fprintf(stderr, "Buffer malloc() failed\n");
         return NULL;
     }
+    memset(client->bufferData.buffer, 0, ReadChunk);
+    client->bufferData.cap = ReadChunk;
     client->bufferData.len = 0;
     client->bufferData.pos = 0;
 
@@ -450,70 +487,61 @@ ClientEventsList* clientListen(Client* client) {
 
         // Check if the client's socket is ready for reading
         if (FD_ISSET(client->socket, &copySet)) {
-            // Handling data received from the server
-            char* buffer = NULL;
-            int bytesReceived = 0;
-            if (client->connType == UDP) {
-                buffer = (char*)malloc(BufferSize);
-                bytesReceived = recvfrom(client->socket, buffer, BufferSize - 1, 0, (SOCKADDR*)&client->sin, &client->recSize);
-            }
-            else if (client->connType == TCP) {
-                // Receive the data from the server
-                bytesReceived = readMessage(client, &buffer);
-            }
+            int disconnected = 0;
 
-            // Handle return codes from readMessage
             if (client->connType == TCP) {
-                if (bytesReceived == READMSG_CONN_CLOSED) {
-                    // Connection closed by peer
-                    eventsList->events = eventReallocClient(eventsList->events, eventsList->numEvents, &eventMemory);
+                /*
+                    Drain every complete message sitting in the buffer before
+                    going back to select(). A single recv() often brings several
+                    messages at once : leaving the extra ones behind would keep
+                    them unread until the next byte happens to arrive.
+                */
+                while (1) {
+                    char* buffer = NULL;
+                    int bytesReceived = readMessage(client, &buffer);
 
-                    // Add the event to the list
-                    eventsList->events[eventsList->numEvents].type = Disconnection;
-                    eventsList->events[eventsList->numEvents].data = NULL;
+                    if (bytesReceived == READMSG_NO_DATA) {
+                        if (buffer != NULL) free(buffer);
+                        break; // No more complete message available
+                    }
+                    else if (bytesReceived > 0) {
+                        eventsList->events = eventReallocClient(eventsList->events, eventsList->numEvents, &eventMemory);
 
-                    eventsList->numEvents++; // Increment the number of events
-                    break;
-                }
-                else if (bytesReceived == READMSG_MSG_TOO_LARGE) {
-                    // Message too large - handle without disconnecting
-                    if (buffer != NULL) free(buffer);
-                    continue; // Skip this iteration, try reading again next loop
-                }
-                else if (bytesReceived == READMSG_ALLOC_FAILED || bytesReceived == READMSG_SOCKET_ERROR) {
-                    // Critical errors - treat as disconnection
-                    eventsList->events = eventReallocClient(eventsList->events, eventsList->numEvents, &eventMemory);
-                    eventsList->events[eventsList->numEvents].type = Disconnection;
-                    eventsList->events[eventsList->numEvents].data = NULL;
-                    eventsList->numEvents++;
-                    break;
-                }
-                else if (bytesReceived > 0) {
-                    // Data received
-                    // Limit the number of bytes received to the buffer size
-                    bytesReceived = (bytesReceived < BufferSize) ? bytesReceived : BufferSize - 1;
+                        // Add the event to the list
+                        eventsList->events[eventsList->numEvents].type = DataReceived;
+                        eventsList->events[eventsList->numEvents].dataSize = bytesReceived;
+                        eventsList->events[eventsList->numEvents].data = (char*)malloc(bytesReceived * sizeof(char));
 
-                    eventsList->events = eventReallocClient(eventsList->events, eventsList->numEvents, &eventMemory);
+                        // Copy the data received to the event
+                        memcpy(eventsList->events[eventsList->numEvents].data, buffer, bytesReceived);
+                        if (buffer != NULL) free(buffer);
 
-                    // Add the event to the list
-                    eventsList->events[eventsList->numEvents].type = DataReceived;
-                    eventsList->events[eventsList->numEvents].dataSize = bytesReceived;
-                    eventsList->events[eventsList->numEvents].data = (char*)malloc(bytesReceived * sizeof(char));
+                        eventsList->numEvents++; // Increment the number of events
+                        continue; // Try to read another message right away
+                    }
+                    else {
+                        /*
+                            Connection closed, allocation failure, socket error,
+                            or a frame we cannot parse any more : in every case
+                            the connection is over.
+                        */
+                        if (buffer != NULL) free(buffer);
 
-                    // Copy the data received to the event
-                    memcpy(eventsList->events[eventsList->numEvents].data, buffer, bytesReceived);
-                    if (buffer != NULL) free(buffer);
+                        eventsList->events = eventReallocClient(eventsList->events, eventsList->numEvents, &eventMemory);
+                        eventsList->events[eventsList->numEvents].type = Disconnection;
+                        eventsList->events[eventsList->numEvents].data = NULL;
+                        eventsList->numEvents++;
 
-                    eventsList->numEvents++; // Increment the number of events
-                }
-                else if (bytesReceived == READMSG_NO_DATA) {
-                    // No complete message available yet, just continue
-                    if (buffer != NULL) free(buffer);
-                    continue;
+                        disconnected = 1;
+                        break;
+                    }
                 }
             }
             else {
                 // UDP case
+                char* buffer = (char*)malloc(BufferSize);
+                int bytesReceived = recvfrom(client->socket, buffer, BufferSize - 1, 0, (SOCKADDR*)&client->sin, &client->recSize);
+
                 if (bytesReceived > 0) {
                     eventsList->events = eventReallocClient(eventsList->events, eventsList->numEvents, &eventMemory);
 
@@ -523,20 +551,53 @@ ClientEventsList* clientListen(Client* client) {
                     eventsList->events[eventsList->numEvents].data = (char*)malloc(bytesReceived * sizeof(char));
 
                     memcpy(eventsList->events[eventsList->numEvents].data, buffer, bytesReceived);
+                    eventsList->numEvents++; // Increment the number of events
+                }
+                else {
+                    disconnected = 1; // UDP socket error or closed
                 }
                 if (buffer != NULL) free(buffer);
-                if (bytesReceived <= 0) break; // UDP socket error or closed
-                eventsList->numEvents++; // Increment the number of events
             }
+
+            if (disconnected) break;
         }
     }
 
     return eventsList;
 }
 
+/*
+    Parameters:
+        - ClientBuffer* bfData : The buffer to grow
+        - int needed : The number of bytes the buffer has to be able to hold
+    Output:
+        - int : 1 if the buffer is large enough, 0 if the allocation failed
+    Description:
+        Grows the accumulation buffer on demand. The read chunk is only how much
+        we take from the socket at once, it is not the maximum size of a message.
+*/
+int bufferEnsureCapacity(ClientBuffer* bfData, int needed) {
+    if (needed <= bfData->cap) {
+        return 1;
+    }
+
+    int newCap = (bfData->cap > 0) ? bfData->cap : ReadChunk;
+    while (newCap < needed) {
+        newCap *= 2;
+    }
+
+    char* temp = (char*)realloc(bfData->buffer, (size_t)newCap);
+    if (!temp) {
+        return 0;
+    }
+
+    bfData->buffer = temp;
+    bfData->cap = newCap;
+    return 1;
+}
+
 int readMessage(Client* client, char **msg) {
     ClientBuffer* bfData = &client->bufferData;
-    int haveLen = 0;
 
     while (1) {
         // Check if we already have at least 4 bytes to read the message length
@@ -544,12 +605,23 @@ int readMessage(Client* client, char **msg) {
             uint32_t lenNet;
             memcpy(&lenNet, bfData->buffer + bfData->pos, 4);
             uint32_t msgLen = ntohl(lenNet); // Convert length from network byte order
-            haveLen = 1;
 
-            // Validate message length
-            if (msgLen == 0 || msgLen > BufferSize - 4) {
-                bfData->pos += 1; // Resynchronize by advancing 1 byte at a time
-                continue;         // Try to find a valid header later
+            /*
+                An invalid length is not noise we can skip : we have no way to
+                tell where the next frame starts, so scanning forward one byte
+                at a time only turns a lost message into a corrupted stream.
+                We report it and let the caller drop the connection.
+            */
+            if (msgLen == 0) {
+                return READMSG_BAD_FRAME;
+            }
+            if (msgLen > (uint32_t)MaxMessageSize) {
+                return READMSG_MSG_TOO_LARGE;
+            }
+
+            // Make room for the announced message, however large it is
+            if (!bufferEnsureCapacity(bfData, 4 + (int)msgLen)) {
+                return READMSG_ALLOC_FAILED;
             }
 
             // Check if the full message has been received
@@ -568,42 +640,47 @@ int readMessage(Client* client, char **msg) {
             }
         }
 
-        // Compact remaining unread data to buffer start
-        if (bfData->len > 0 && bfData->pos < bfData->len) {
+        /*
+            Compact remaining unread data to buffer start. This also has to run
+            when everything has been consumed (pos == len), otherwise the read
+            window shrinks message after message until recv() is called with a
+            size of 0 - which returns 0, and reads exactly like a closed
+            connection.
+        */
+        if (bfData->pos > 0) {
             memmove(bfData->buffer, bfData->buffer + bfData->pos, bfData->len - bfData->pos);
             bfData->len -= bfData->pos;
             bfData->pos = 0;
         }
 
+        // Always keep a full chunk of room available for the next read
+        if (!bufferEnsureCapacity(bfData, bfData->len + ReadChunk)) {
+            return READMSG_ALLOC_FAILED;
+        }
+
         // Read more data from the socket
-        int n = recv(client->socket, bfData->buffer + bfData->len, BufferSize - bfData->len, 0);
+        int n = recv(client->socket, bfData->buffer + bfData->len, bfData->cap - bfData->len, 0);
         if (n < 0) {
+            /*
+                Nothing more to read for now. The incomplete frame stays in the
+                buffer and is completed on a later call : we hand control back
+                to the caller instead of sleeping inside its event loop.
+            */
 #ifdef _WIN32
-            int err = WSAGetLastError();
-            if (err == WSAEWOULDBLOCK) {
-                if (!haveLen) {
-                    return READMSG_NO_DATA;
-                } else {
-                    Sleep(10);
-                    continue;
-                }
-            } 
-            else {
-                return READMSG_SOCKET_ERROR;
+            if (WSAGetLastError() == WSAEWOULDBLOCK) {
+                return READMSG_NO_DATA;
             }
+            return READMSG_SOCKET_ERROR;
 #else
-            if (errno == EWOULDBLOCK || errno == EAGAIN) {
-                if (!haveLen) {
-                    return READMSG_NO_DATA;
-                } else {
-                    usleep(10 * 1000);
-                    continue;
-                }
-            } else {
-                return READMSG_SOCKET_ERROR;
+            if (errno == EINTR) {
+                continue;
             }
+            if (errno == EWOULDBLOCK || errno == EAGAIN) {
+                return READMSG_NO_DATA;
+            }
+            return READMSG_SOCKET_ERROR;
 #endif
-        } 
+        }
         else if (n == 0) {
             return READMSG_CONN_CLOSED;
         }
@@ -612,41 +689,109 @@ int readMessage(Client* client, char **msg) {
     }
 }
 
-void sendMessage(SOCKET* socket, const char *msg, uint32_t len, int connType, int ipType, SIN* sin) {
+/*
+    Parameters:
+        - SOCKET socket : The socket to send the data to
+        - const char* data : The bytes to send
+        - uint32_t len : How many bytes to send
+    Output:
+        - int : SENDMSG_OK once every byte has been handed to the kernel
+    Description:
+        Sends the whole buffer. The sockets are non-blocking, so a full send
+        buffer makes send() fail with EWOULDBLOCK : that is not an error, it
+        only means we have to wait for the peer to drain. Giving up there would
+        truncate the payload while its length header is already on the wire.
+*/
+int sendAll(SOCKET socket, const char* data, uint32_t len) {
+    uint32_t totalSent = 0;
+
+    while (totalSent < len) {
+        int sent = send(socket, data + totalSent, (int)(len - totalSent), 0);
+        if (sent > 0) {
+            totalSent += (uint32_t)sent;
+            continue;
+        }
+        if (sent == 0) {
+            return SENDMSG_SOCKET_ERROR;
+        }
+
+#ifdef _WIN32
+        if (WSAGetLastError() != WSAEWOULDBLOCK) {
+            return SENDMSG_SOCKET_ERROR;
+        }
+#else
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno != EWOULDBLOCK && errno != EAGAIN) {
+            return SENDMSG_SOCKET_ERROR;
+        }
+#endif
+
+        // Wait for the send buffer to have room again
+        fd_set writeSet;
+        FD_ZERO(&writeSet);
+        FD_SET(socket, &writeSet);
+
+        struct timeval timeout;
+        timeout.tv_sec = SendTimeoutMs / 1000;
+        timeout.tv_usec = (SendTimeoutMs % 1000) * 1000;
+
+        int ready = select((int)socket + 1, NULL, &writeSet, NULL, &timeout);
+        if (ready == 0) {
+            return SENDMSG_TIMEOUT;
+        }
+        if (ready < 0) {
+            return SENDMSG_SOCKET_ERROR;
+        }
+    }
+
+    return SENDMSG_OK;
+}
+
+int sendMessage(SOCKET* socket, const char *msg, uint32_t len, int connType, int ipType, SIN* sin) {
+    if (!socket || !msg) {
+        return SENDMSG_INVALID_ARG;
+    }
+
     int realType = 0;
     socklen_t length = sizeof(realType);
     getsockopt(*socket, SOL_SOCKET, SO_TYPE, (char*)&realType, &length);
+
     if (connType == TCP && realType == SOCK_STREAM) {
+        // A length of 0 has no valid framing, and readMessage would reject it
+        if (len == 0) {
+            return SENDMSG_INVALID_ARG;
+        }
+        if (len > (uint32_t)MaxMessageSize) {
+            return SENDMSG_MSG_TOO_LARGE;
+        }
+
         uint32_t len_net = htonl(len);
-        int totalSent = 0;
-        while (totalSent < 4) {
-            int sent = send(*socket, ((char *)&len_net) + totalSent, 4 - totalSent, 0);
-            if (sent <= 0) {
-                break;
-            }
-            totalSent += sent;
+        int status = sendAll(*socket, (const char*)&len_net, 4);
+        if (status != SENDMSG_OK) {
+            return status;
         }
-        totalSent = 0;
-        while (totalSent < len) {
-            int sent = send(*socket, msg + totalSent, len - totalSent, 0);
-            if (sent <= 0) {
-                break;
-            }
-            totalSent += sent;
-        }
+        return sendAll(*socket, msg, len);
     }
     else if (connType == UDP && realType == SOCK_DGRAM) {
-        if (!sin) return; // NULL address
+        if (!sin) return SENDMSG_INVALID_ARG; // NULL address
+
+        int sent = SOCKET_ERROR;
         if (ipType == IPv4) {
-            sendto(*socket, msg, len, 0, (SOCKADDR*)&sin->in, sizeof(sin->in));
+            sent = sendto(*socket, msg, len, 0, (SOCKADDR*)&sin->in, sizeof(sin->in));
         }
         else if (ipType == IPv6) {
-            sendto(*socket, msg, len, 0, (SOCKADDR*)&sin->in6, sizeof(sin->in6));
+            sent = sendto(*socket, msg, len, 0, (SOCKADDR*)&sin->in6, sizeof(sin->in6));
         }
+        else {
+            return SENDMSG_INVALID_ARG;
+        }
+        return (sent == SOCKET_ERROR) ? SENDMSG_SOCKET_ERROR : SENDMSG_OK;
     }
-    else {
-        fprintf(stderr, "Error : connType and socket type are not matching.\n");
-    }
+
+    fprintf(stderr, "Error : connType and socket type are not matching.\n");
+    return SENDMSG_INVALID_ARG;
 }
 
 char* resolveDomainName(const char* domainName) {

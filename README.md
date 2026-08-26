@@ -8,10 +8,11 @@
 - [History](#history)
 - [Features](#features)
 - [Usage Example](#usage-example)
+- [Tests](#tests)
 - [Contributing](#contributing)
 
 ## History
-This is the second version of the library, it was created in **July 2024**.  
+This is the third version of the library, first created in **July 2024**.  
 It’s not thoroughly documented, as I mainly built it as a support tool for my other project, [NSCpp](https://github.com/Tom-KB/NSCpp).  
 Feel free to use it if you find it useful. It may receive occasional updates, but mainly for **bug fixes**—no new features are planned.
 
@@ -24,10 +25,16 @@ Here’s a list of features provided by the library:
  - **Domain Name resolution**
  - An **event** system
  - **Windows** and **Linux** support
+ - Messages up to `MaxMessageSize` (16 MiB by default), the read buffer grows on demand
 
 ## Usage example
 You can find a *basic* chat application example—supporting **TCP** or **UDP** and **IPv4** or **IPv6**—in the [examples folder](examples/).  
 You can also find a `.a` and `.lib` of the last version of NSC inside the [static library's folder](static-library/).
+
+## Tests
+The framing tests live in the [tests folder](tests/).  
+Run `compileTests.bat` on Windows or `compileTests.sh` on Linux.  
+They cover message sizes around the read chunk and well beyond it, several messages arriving in a single read, messages split across several reads, and invalid announced lengths.
 
 ## Contributing
 Contributions are welcome.  
